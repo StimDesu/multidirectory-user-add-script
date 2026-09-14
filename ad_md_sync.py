@@ -2,7 +2,17 @@
 """
 ad_md_sync.py - перенос и синхронизация пользователей из Microsoft AD в MultiDirectory (MD).
 
-Команды:
+Самый простой способ начать -- запустить скрипт вообще без параметров:
+
+    python ad_md_sync.py
+
+Откроется интерактивное меню: при первом запуске оно спросит адреса AD и MD
+и служебные учётные записи (и сохранит их в config.yaml), а дальше даст
+выбрать нужные OU из списка, полученного прямо из AD, и действие
+(перенос / синхронизация), не заставляя вспоминать флаги командной строки.
+
+Команды для запуска без меню (например, из cron / systemd timer):
+    menu      Интерактивное меню (используется по умолчанию).
     migrate   Разовый перенос: создать структуру OU и пользователей в MD.
     sync      Сравнить текущее состояние AD с MD и применить изменения
               (создание, переименование/перемещение, изменение атрибутов,
@@ -11,6 +21,7 @@ ad_md_sync.py - перенос и синхронизация пользоват�
               / systemd timer.
 
 Примеры:
+    python ad_md_sync.py
     python ad_md_sync.py --config config.yaml migrate
     python ad_md_sync.py --config config.yaml migrate --ou "OU=Moscow,OU=Users,DC=corp,DC=local"
     python ad_md_sync.py --config config.yaml sync --dry-run
@@ -27,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import logging
 import os
 import secrets
@@ -208,9 +220,14 @@ def migrate_users(
         }
 
 
-def cmd_migrate(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+def do_migrate(
+    cfg: dict[str, Any],
+    bases: list[str],
+    dry_run: bool,
+    skip_ous: bool = False,
+    skip_users: bool = False,
+) -> None:
     ad_cfg, md_cfg, sync_cfg = cfg["source_ad"], cfg["target_md"], cfg["sync"]
-    bases = args.ou or cfg["organizational_units"] or [ad_cfg["base_dn"]]
 
     with ADSource(
         ad_cfg["server"], ad_cfg["bind_dn"], ad_cfg["password"], ad_cfg["base_dn"],
@@ -220,14 +237,19 @@ def cmd_migrate(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
         md.login(md_cfg["username"], md_cfg["password"])
         try:
             state = load_state(sync_cfg["state_file"])
-            if not args.skip_ous:
-                migrate_ous(ad, md, bases, ad_cfg["base_dn"], md_cfg["base_dn"], args.dry_run)
-            if not args.skip_users:
-                migrate_users(ad, md, bases, ad_cfg["base_dn"], md_cfg["base_dn"], sync_cfg, state, args.dry_run)
-            if not args.dry_run:
+            if not skip_ous:
+                migrate_ous(ad, md, bases, ad_cfg["base_dn"], md_cfg["base_dn"], dry_run)
+            if not skip_users:
+                migrate_users(ad, md, bases, ad_cfg["base_dn"], md_cfg["base_dn"], sync_cfg, state, dry_run)
+            if not dry_run:
                 save_state(sync_cfg["state_file"], state)
         finally:
             md.logout()
+
+
+def cmd_migrate(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    bases = args.ou or cfg["organizational_units"] or [cfg["source_ad"]["base_dn"]]
+    do_migrate(cfg, bases, args.dry_run, skip_ous=args.skip_ous, skip_users=args.skip_users)
 
 
 # --------------------------------------------------------------------------- #
@@ -378,14 +400,262 @@ def cmd_sync(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Мастер настройки: создаёт config.yaml по ответам в консоли, чтобы не нужно
+# было гадать, какие поля и в каком формате заполнять руками.
+# --------------------------------------------------------------------------- #
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or default
+
+
+def _ask_yes_no(prompt: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    value = input(f"{prompt} [{hint}]: ").strip().lower()
+    if not value:
+        return default
+    return value in ("y", "yes", "д", "да")
+
+
+def run_config_wizard(path: str) -> dict[str, Any]:
+    """Интерактивно спрашивает адреса/учётки AD и MD и сохраняет config.yaml."""
+    print("=== Мастер настройки ad_md_sync ===")
+    print(
+        "Сейчас потребуется указать адрес контроллера домена AD и адрес REST API\n"
+        "MultiDirectory, а также служебные учётные записи для чтения AD и записи в MD.\n"
+    )
+
+    print("--- Источник: Microsoft Active Directory ---")
+    ad_server = _ask("Адрес контроллера домена (ldap:// или ldaps://)", "ldaps://dc1.corp.example.local")
+    ad_use_ssl = _ask_yes_no("Использовать LDAPS (шифрованное соединение)?", True)
+    ad_validate_cert = True
+    if ad_use_ssl:
+        ad_validate_cert = _ask_yes_no("Проверять сертификат сервера AD?", True)
+    ad_bind_dn = _ask(
+        "DN служебной учётной записи для чтения AD",
+        "CN=svc-md-sync,OU=Service Accounts,DC=corp,DC=example,DC=local",
+    )
+    ad_password = getpass.getpass("Пароль этой учётной записи AD (ввод скрыт): ")
+    ad_base_dn = _ask("Base DN домена AD", "DC=corp,DC=example,DC=local")
+
+    print("\n--- Приёмник: MultiDirectory ---")
+    md_base_url = _ask("Базовый URL REST API MultiDirectory", "https://md.corp.example.local/api")
+    md_verify_ssl = _ask_yes_no("Проверять TLS-сертификат сервера MD?", True)
+    md_username = _ask("Логин служебной учётной записи MD (DN, UPN или sAMAccountName)", "svc-md-sync")
+    md_password = getpass.getpass("Пароль этой учётной записи MD (ввод скрыт): ")
+    md_base_dn = _ask("Base DN домена MD (куда переносим)", "DC=md,DC=example,DC=local")
+
+    print("\n--- Прочее ---")
+    on_missing = _ask("Что делать с учёткой в MD, если пользователь пропал из AD "
+                       "(disable/delete/ignore)", "disable")
+    if on_missing not in ("disable", "delete", "ignore"):
+        print(f"Не распознано {on_missing!r}, использую 'disable'.")
+        on_missing = "disable"
+
+    cfg: dict[str, Any] = {
+        "source_ad": {
+            "server": ad_server,
+            "bind_dn": ad_bind_dn,
+            "password": ad_password,
+            "base_dn": ad_base_dn,
+            "use_ssl": ad_use_ssl,
+            "validate_cert": ad_validate_cert,
+        },
+        "target_md": {
+            "base_url": md_base_url,
+            "username": md_username,
+            "password": md_password,
+            "base_dn": md_base_dn,
+            "verify_ssl": md_verify_ssl,
+        },
+        "organizational_units": [],
+        "sync": {
+            "state_file": "./state.json",
+            "on_missing_in_ad": on_missing,
+            "object_classes": DEFAULT_OBJECT_CLASSES,
+            "attribute_names": DEFAULT_ATTRIBUTE_NAMES,
+            "generated_password_length": 20,
+            "password_log_file": "./new_passwords.csv",
+        },
+    }
+
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+    print(
+        f"\nКонфигурация сохранена в {path!r}. Файл содержит пароли в открытом виде -- "
+        "права на файл ограничены (chmod 600), но по возможности вынесите пароли в "
+        "переменные окружения AD_BIND_PASSWORD / MD_BIND_PASSWORD и уберите их из файла.\n"
+    )
+    return load_config(path)
+
+
+def _print_config_summary(cfg: dict[str, Any]) -> None:
+    ad_cfg, md_cfg, sync_cfg = cfg["source_ad"], cfg["target_md"], cfg["sync"]
+    print("\n--- Текущая конфигурация (пароли скрыты) ---")
+    print(f"AD сервер:      {ad_cfg['server']}  (LDAPS: {ad_cfg.get('use_ssl', True)})")
+    print(f"AD bind DN:     {ad_cfg['bind_dn']}")
+    print(f"AD base DN:     {ad_cfg['base_dn']}")
+    print(f"MD base_url:    {md_cfg['base_url']}")
+    print(f"MD пользователь:{md_cfg['username']}")
+    print(f"MD base DN:     {md_cfg['base_dn']}")
+    print(f"OU по умолчанию:{cfg.get('organizational_units') or '(весь домен)'}")
+    print(f"on_missing_in_ad: {sync_cfg['on_missing_in_ad']}")
+    print(f"state_file:     {sync_cfg['state_file']}")
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# Интерактивное меню -- выбор действия и OU без запоминания флагов CLI.
+# --------------------------------------------------------------------------- #
+def _manual_ou_entry() -> list[str]:
+    print("Вводите DN организационных юнитов по одному, пустая строка -- закончить.")
+    result: list[str] = []
+    while True:
+        dn = input("OU DN> ").strip()
+        if not dn:
+            break
+        result.append(dn)
+    return result
+
+
+def select_ous_interactive(cfg: dict[str, Any]) -> list[str]:
+    ad_cfg = cfg["source_ad"]
+    print("\nПодключаюсь к AD, чтобы показать список доступных OU...")
+    ous: list[str] = []
+    try:
+        with ADSource(
+            ad_cfg["server"], ad_cfg["bind_dn"], ad_cfg["password"], ad_cfg["base_dn"],
+            use_ssl=ad_cfg.get("use_ssl", True), validate_cert=ad_cfg.get("validate_cert", True),
+        ) as ad:
+            ous = sorted(ad.iter_ou_dns([ad_cfg["base_dn"]]), key=dn_utils.depth)
+    except Exception as exc:
+        print(f"Не удалось получить список OU из AD: {exc}")
+
+    if not ous:
+        print("Список OU получить не удалось (или в домене нет OU).")
+        if _ask_yes_no("Ввести DN нужных OU вручную?", False):
+            return _manual_ou_entry()
+        return cfg.get("organizational_units") or [ad_cfg["base_dn"]]
+
+    print("\nНайденные в AD организационные юниты:")
+    for i, dn in enumerate(ous, 1):
+        print(f"  {i:>3}. {dn}")
+    print(
+        "\nВведите номера нужных OU через запятую (например: 1,3,5)\n"
+        "  'all'    -- взять весь домен, без фильтра по OU\n"
+        "  'manual' -- ввести DN вручную\n"
+        "  <пусто>  -- использовать organizational_units из config.yaml"
+    )
+    choice = input("> ").strip()
+
+    if choice.lower() == "all":
+        return [ad_cfg["base_dn"]]
+    if choice.lower() == "manual":
+        return _manual_ou_entry()
+    if not choice:
+        return cfg.get("organizational_units") or [ad_cfg["base_dn"]]
+
+    try:
+        idxs = [int(x.strip()) for x in choice.split(",") if x.strip()]
+        selected = [ous[i - 1] for i in idxs]
+        if not selected:
+            raise ValueError
+        return selected
+    except (ValueError, IndexError):
+        print("Не удалось разобрать ввод, использую organizational_units из config.yaml.")
+        return cfg.get("organizational_units") or [ad_cfg["base_dn"]]
+
+
+def interactive_menu(config_path: str) -> int:
+    if not os.path.exists(config_path):
+        print(f"Файл конфигурации {config_path!r} не найден.")
+        if not _ask_yes_no("Запустить мастер настройки и создать его сейчас?", True):
+            print(
+                f"Без конфигурации работать нельзя. Скопируйте config.example.yaml в "
+                f"{config_path!r} и заполните вручную, либо запустите скрипт заново."
+            )
+            return 1
+        cfg = run_config_wizard(config_path)
+    else:
+        cfg = load_config(config_path)
+
+    while True:
+        print("\n================= ad_md_sync =================")
+        print(f"Конфигурация: {config_path}")
+        print(f"  AD: {cfg['source_ad']['server']}  (base: {cfg['source_ad']['base_dn']})")
+        print(f"  MD: {cfg['target_md']['base_url']}  (base: {cfg['target_md']['base_dn']})")
+        print("------------------------------------------------")
+        print("  1. Перенести пользователей и структуру OU из AD в MD (migrate)")
+        print("  2. Синхронизировать изменения AD -> MD, один проход (sync)")
+        print("  3. Синхронизировать в режиме демона, по интервалу")
+        print("  4. Настроить подключение заново (пересоздать config.yaml)")
+        print("  5. Показать текущую конфигурацию")
+        print("  0. Выход")
+        choice = input("Выберите пункт меню: ").strip().lower()
+
+        if choice in ("0", "q", "quit", "exit", ""):
+            return 0
+        if choice == "4":
+            cfg = run_config_wizard(config_path)
+            continue
+        if choice == "5":
+            _print_config_summary(cfg)
+            continue
+        if choice not in ("1", "2", "3"):
+            print("Некорректный пункт меню, попробуйте снова.")
+            continue
+
+        bases = select_ous_interactive(cfg)
+        if not bases:
+            print("OU не выбраны, действие отменено.")
+            continue
+        dry_run = _ask_yes_no("Тестовый прогон без реальных изменений (dry-run)?", False)
+
+        try:
+            if choice == "1":
+                do_migrate(cfg, bases, dry_run)
+                print("Перенос завершён.")
+            elif choice == "2":
+                sync_once(cfg, bases, dry_run)
+                print("Синхронизация выполнена.")
+            elif choice == "3":
+                interval_raw = _ask("Интервал между проходами, секунд", "300")
+                try:
+                    interval = max(1, int(interval_raw))
+                except ValueError:
+                    interval = 300
+                print(f"Синхронизация каждые {interval} сек. Остановить -- Ctrl+C.")
+                while True:
+                    try:
+                        sync_once(cfg, bases, dry_run)
+                    except MDError as exc:
+                        logger.error("Ошибка MultiDirectory: %s", exc)
+                    time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nОстановлено пользователем.")
+        except MDError as exc:
+            print(f"Ошибка MultiDirectory: {exc}")
+        except Exception:
+            logger.exception("Ошибка при выполнении выбранного действия")
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Перенос и синхронизация пользователей AD -> MultiDirectory")
-    parser.add_argument("--config", required=True, help="Путь к YAML-конфигу (см. config.example.yaml)")
+    parser.add_argument(
+        "--config", default="config.yaml",
+        help="Путь к YAML-конфигу (по умолчанию ./config.yaml; см. config.example.yaml)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Подробный лог (DEBUG)")
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     p_migrate = sub.add_parser("migrate", help="Разовый перенос OU и пользователей из AD в MD")
     p_migrate.add_argument(
@@ -407,6 +677,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.set_defaults(func=cmd_sync)
 
+    sub.add_parser(
+        "menu",
+        help="Интерактивное меню с подсказками (запускается по умолчанию, если команда не указана)",
+    )
+
     return parser
 
 
@@ -418,6 +693,12 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+
+    # Без указанной команды (в т.ч. просто "python ad_md_sync.py") запускаем
+    # интерактивное меню -- оно само спросит про config.yaml, если его нет.
+    command = args.command or "menu"
+    if command == "menu":
+        return interactive_menu(args.config)
 
     cfg = load_config(args.config)
 
