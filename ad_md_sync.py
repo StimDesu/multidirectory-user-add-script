@@ -41,6 +41,7 @@ import csv
 import getpass
 import logging
 import os
+import re
 import secrets
 import string
 import sys
@@ -417,6 +418,23 @@ def _ask_yes_no(prompt: str, default: bool = True) -> bool:
     return value in ("y", "yes", "д", "да")
 
 
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+
+def _ask_host(prompt: str, default_host: str) -> str:
+    """Спрашивает голый адрес сервера (без ldap://, ldaps://, http:// и т.п.).
+
+    Если пользователь всё же введёт схему (в том числе с опечаткой вроде
+    "ladps://") -- она отбрасывается, чтобы опечатка в ней не привела к
+    неверно собранному URL и путанице с отдельным вопросом про LDAPS/TLS.
+    """
+    value = _ask(prompt, default_host)
+    stripped = _SCHEME_RE.sub("", value).strip().rstrip("/")
+    if stripped != value:
+        print(f"  (схема из адреса убрана, использую: {stripped!r})")
+    return stripped or default_host
+
+
 def _ask_base_dn(prompt: str, default: str) -> str:
     """Base DN -- это корень домена (только компоненты dc=...), а не DN
     конкретного пользователя или OU. Переспрашиваем, пока не введут именно его,
@@ -452,8 +470,9 @@ def run_config_wizard(path: str) -> dict[str, Any]:
     )
 
     print("--- Источник: Microsoft Active Directory ---")
-    ad_server = _ask("Адрес контроллера домена (ldap:// или ldaps://)", "ldaps://dc1.corp.example.local")
-    ad_use_ssl = _ask_yes_no("Использовать LDAPS (шифрованное соединение)?", True)
+    ad_host = _ask_host("Адрес контроллера домена (имя или IP, без ldap://)", "dc1.corp.example.local")
+    ad_use_ssl = _ask_yes_no("Использовать LDAPS (шифрованное соединение, порт 636)?", True)
+    ad_server = f"{'ldaps' if ad_use_ssl else 'ldap'}://{ad_host}"
     ad_validate_cert = True
     if ad_use_ssl:
         ad_validate_cert = _ask_yes_no("Проверять сертификат сервера AD?", True)
