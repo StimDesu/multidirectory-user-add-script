@@ -6,8 +6,15 @@
 source_ad:
   # LDAPS настоятельно рекомендуется (пароль сервисной учётки идёт по сети)
   server: "ldaps://dc1.corp.example.local"
-  bind_dn: "CN=svc-md-sync,OU=Service Accounts,DC=corp,DC=example,DC=local"
+  # Служебная учётка ТОЛЬКО для чтения AD (не личная, не Administrator).
+  # Как её завести безопасно -- см. README.md, раздел «Служебные учётные
+  # записи». Для логина проще указать UPN (user@domain), как ниже -- полный
+  # DN (CN=...,OU=...,DC=...) тоже работает, но искать/вводить его вручную
+  # не обязательно.
+  bind_dn: "svc-md-sync@corp.example.local"
   password: "CHANGE_ME"
+  # Base DN -- это корень домена (только dc=...), НЕ DN конкретного
+  # пользователя или OU.
   base_dn: "DC=corp,DC=example,DC=local"
   use_ssl: true
   validate_cert: true
@@ -15,9 +22,13 @@ source_ad:
 target_md:
   # Базовый URL REST API MultiDirectory (см. openapi.json)
   base_url: "https://md.corp.example.local/api"
+  # Служебная учётка в MD с правами записи только в целевые OU (см. README).
+  # Логин может быть коротким (sAMAccountName), UPN или DN -- MD принимает
+  # любой из этих форматов при входе.
   username: "svc-md-sync"
   password: "CHANGE_ME"
-  base_dn: "DC=corp,DC=example,DC=local"
+  # Base DN -- корень домена MD (только dc=...), а не DN пользователя/OU.
+  base_dn: "DC=md,DC=example,DC=local"
   verify_ssl: true
 
 # OU в AD, которые нужно переносить / синхронизировать (полный DN).

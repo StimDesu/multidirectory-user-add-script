@@ -417,6 +417,32 @@ def _ask_yes_no(prompt: str, default: bool = True) -> bool:
     return value in ("y", "yes", "д", "да")
 
 
+def _ask_base_dn(prompt: str, default: str) -> str:
+    """Base DN -- это корень домена (только компоненты dc=...), а не DN
+    конкретного пользователя или OU. Переспрашиваем, пока не введут именно его,
+    чтобы не повторить ошибку вида "cn=admin,cn=Users,dc=...,dc=..." на месте
+    base DN.
+    """
+    while True:
+        value = _ask(prompt, default)
+        try:
+            comps = dn_utils.components(value)
+        except Exception as exc:
+            print(f"  Не удалось разобрать значение как DN: {exc}. Попробуйте ещё раз.")
+            continue
+        bad = [c for c in comps if not c.lower().startswith("dc=")]
+        if bad or not comps:
+            print(
+                "  Base DN должен состоять только из компонентов dc=... (это корень "
+                "домена), например 'DC=corp,DC=example,DC=local'.\n"
+                f"  Вы ввели компонент(ы), которые не являются dc=: {', '.join(bad) or '(пусто)'}.\n"
+                "  Похоже, это DN конкретного объекта (пользователя, OU и т.п.), а не "
+                "базовый DN домена -- введите ещё раз."
+            )
+            continue
+        return value
+
+
 def run_config_wizard(path: str) -> dict[str, Any]:
     """Интерактивно спрашивает адреса/учётки AD и MD и сохраняет config.yaml."""
     print("=== Мастер настройки ad_md_sync ===")
@@ -431,19 +457,38 @@ def run_config_wizard(path: str) -> dict[str, Any]:
     ad_validate_cert = True
     if ad_use_ssl:
         ad_validate_cert = _ask_yes_no("Проверять сертификат сервера AD?", True)
+    print(
+        "\n  Нужна отдельная служебная учётная запись для ЧТЕНИЯ AD (не ваша личная,\n"
+        "  не Administrator). Как её безопасно завести -- см. README, раздел\n"
+        "  «Служебные учётные записи». Для входа проще всего указать её UPN\n"
+        "  (логин вида user@domain, тот же формат, что и при входе в Windows/почту) --\n"
+        "  полный DN тоже подойдёт, но вводить и искать его вручную не нужно.\n"
+    )
     ad_bind_dn = _ask(
-        "DN служебной учётной записи для чтения AD",
-        "CN=svc-md-sync,OU=Service Accounts,DC=corp,DC=example,DC=local",
+        "Логин служебной учётной записи для чтения AD (UPN, например svc-md-sync@corp.example.local)",
+        "svc-md-sync@corp.example.local",
     )
     ad_password = getpass.getpass("Пароль этой учётной записи AD (ввод скрыт): ")
-    ad_base_dn = _ask("Base DN домена AD", "DC=corp,DC=example,DC=local")
+    ad_base_dn = _ask_base_dn(
+        "Base DN домена AD -- корень домена, только dc=... (НЕ DN пользователя/OU)",
+        "DC=corp,DC=example,DC=local",
+    )
 
     print("\n--- Приёмник: MultiDirectory ---")
     md_base_url = _ask("Базовый URL REST API MultiDirectory", "https://md.corp.example.local/api")
     md_verify_ssl = _ask_yes_no("Проверять TLS-сертификат сервера MD?", True)
-    md_username = _ask("Логин служебной учётной записи MD (DN, UPN или sAMAccountName)", "svc-md-sync")
+    print(
+        "\n  Аналогично нужна отдельная служебная учётная запись в MD с правами на\n"
+        "  запись только в целевые OU (не администратор домена целиком) -- см. README.\n"
+        "  Для входа подойдёт короткий логин (sAMAccountName), UPN или DN -- MD\n"
+        "  принимает любой из этих форматов.\n"
+    )
+    md_username = _ask("Логин служебной учётной записи MD (например svc-ad-sync)", "svc-md-sync")
     md_password = getpass.getpass("Пароль этой учётной записи MD (ввод скрыт): ")
-    md_base_dn = _ask("Base DN домена MD (куда переносим)", "DC=md,DC=example,DC=local")
+    md_base_dn = _ask_base_dn(
+        "Base DN домена MD -- корень домена, только dc=... (НЕ DN пользователя/OU)",
+        "DC=md,DC=example,DC=local",
+    )
 
     print("\n--- Прочее ---")
     on_missing = _ask("Что делать с учёткой в MD, если пользователь пропал из AD "
