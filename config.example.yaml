@@ -1,0 +1,64 @@
+# Пример конфигурации ad_md_sync.py
+# Скопируйте в config.yaml и заполните реальными значениями.
+# Пароли лучше не хранить в открытом виде -- можно вынести в переменные
+# окружения и подставлять перед запуском (см. README.md).
+
+source_ad:
+  # LDAPS настоятельно рекомендуется (пароль сервисной учётки идёт по сети)
+  server: "ldaps://dc1.corp.example.local"
+  bind_dn: "CN=svc-md-sync,OU=Service Accounts,DC=corp,DC=example,DC=local"
+  password: "CHANGE_ME"
+  base_dn: "DC=corp,DC=example,DC=local"
+  use_ssl: true
+  validate_cert: true
+
+target_md:
+  # Базовый URL REST API MultiDirectory (см. openapi.json)
+  base_url: "https://md.corp.example.local/api"
+  username: "svc-md-sync"
+  password: "CHANGE_ME"
+  base_dn: "DC=corp,DC=example,DC=local"
+  verify_ssl: true
+
+# OU в AD, которые нужно переносить / синхронизировать (полный DN).
+# Если список пуст -- берётся весь source_ad.base_dn.
+organizational_units:
+  - "OU=Moscow,OU=Users,DC=corp,DC=example,DC=local"
+  - "OU=SPB,OU=Users,DC=corp,DC=example,DC=local"
+
+sync:
+  # Файл, в котором скрипт хранит соответствие AD objectGUID <-> DN в MD,
+  # снимок атрибутов и статус учётки. Нужен только для режима `sync`.
+  state_file: "./state.json"
+
+  # Что делать с учёткой в MD, если пользователь исчез из выбранных OU в AD
+  # (удалён, перемещён за пределы отслеживаемых OU и т.п.):
+  #   disable -- заблокировать учётку в MD (безопасный вариант, по умолчанию)
+  #   delete  -- удалить запись в MD
+  #   ignore  -- ничего не делать
+  on_missing_in_ad: "disable"
+
+  # objectClass, с которым создаются пользователи в MD
+  object_classes: ["top", "person", "organizationalPerson", "user"]
+
+  # Сопоставление полей AD-пользователя именам атрибутов в MD.
+  # Ключи слева менять не нужно -- это внутренние поля скрипта.
+  attribute_names:
+    sam: sAMAccountName
+    upn: userPrincipalName
+    cn: cn
+    given_name: givenName
+    sn: sn
+    display_name: displayName
+    mail: mail
+    phone: telephoneNumber
+
+  # Длина генерируемого пароля для новых учёток в MD.
+  # Пароли из AD прочитать невозможно (хранятся в виде хэша), поэтому
+  # новым пользователям в MD выставляется случайный пароль.
+  generated_password_length: 20
+
+  # Куда сохранять DN/логин/пароль вновь созданных пользователей.
+  # !!! Файл содержит пароли в открытом виде. Раздайте пароли пользователям
+  # и удалите/зашифруйте файл. Пустое значение отключает запись файла.
+  password_log_file: "./new_passwords.csv"
